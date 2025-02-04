@@ -1,13 +1,14 @@
-local http = require("resty.http")
-local ssl = require("ngx.ssl")
-local ocsp = require("ngx.ocsp")
-local ngx = ngx
-local string = string
-local tostring = tostring
-local re_sub = ngx.re.sub
-local unpack = unpack
-
-local dns_lookup = require("util.dns").lookup
+local http         = require("resty.http")
+local ssl          = require("ngx.ssl")
+local ocsp         = require("ngx.ocsp")
+local ngx          = ngx
+local string       = string
+local tostring     = tostring
+local re_sub       = ngx.re.sub
+local unpack       = unpack
+local dns_lookup   = require("util.dns").lookup
+local openssl_asn1 = require("resty.openssl.asn1")
+local os           = os
 
 local _M = {
   is_ocsp_stapling_enabled = false
@@ -15,24 +16,30 @@ local _M = {
 
 local DEFAULT_CERT_HOSTNAME = "_"
 
-local certificate_data = ngx.shared.certificate_data
+local certificate_data    = ngx.shared.certificate_data
 local certificate_servers = ngx.shared.certificate_servers
 local ocsp_response_cache = ngx.shared.ocsp_response_cache
 
+--------------------------------------------------------------------------------
+-- Convert PEM certificate (and private key) to DER format.
+--------------------------------------------------------------------------------
 local function get_der_cert_and_priv_key(pem_cert_key)
   local der_cert, der_cert_err = ssl.cert_pem_to_der(pem_cert_key)
   if not der_cert then
     return nil, nil, "failed to convert certificate chain from PEM to DER: " .. der_cert_err
   end
 
-  local der_priv_key, dev_priv_key_err = ssl.priv_key_pem_to_der(pem_cert_key)
+  local der_priv_key, der_priv_key_err = ssl.priv_key_pem_to_der(pem_cert_key)
   if not der_priv_key then
-    return nil, nil, "failed to convert private key from PEM to DER: " .. dev_priv_key_err
+    return nil, nil, "failed to convert private key from PEM to DER: " .. der_priv_key_err
   end
 
   return der_cert, der_priv_key, nil
 end
 
+--------------------------------------------------------------------------------
+-- Set the certificate and key on the current connection.
+--------------------------------------------------------------------------------
 local function set_der_cert_and_key(der_cert, der_priv_key)
   local set_cert_ok, set_cert_err = ssl.set_der_cert(der_cert)
   if not set_cert_ok then
@@ -45,12 +52,13 @@ local function set_der_cert_and_key(der_cert, der_priv_key)
   end
 end
 
+--------------------------------------------------------------------------------
+-- Lookup the certificate UID for a given hostname (normalized to lowercase).
+--------------------------------------------------------------------------------
 local function get_pem_cert_uid(raw_hostname)
-  -- Convert hostname to ASCII lowercase (see RFC 6125 6.4.1) so that requests with uppercase
-  -- host would lead to the right certificate being chosen (controller serves certificates for
-  -- lowercase hostnames as specified in Ingress object's spec.rules.host)
-  local hostname = re_sub(raw_hostname, "\\.$", "", "jo"):gsub("[A-Z]",
-    function(c) return c:lower() end)
+  local hostname = re_sub(raw_hostname, "\\.$", "", "jo"):gsub("[A-Z]", function(c)
+    return c:lower()
+  end)
 
   local uid = certificate_servers:get(hostname)
   if uid then
@@ -70,20 +78,25 @@ local function get_pem_cert_uid(raw_hostname)
   return uid
 end
 
+--------------------------------------------------------------------------------
+-- For now, return the global setting for OCSP stapling.
+--------------------------------------------------------------------------------
 local function is_ocsp_stapling_enabled_for(_)
-  -- TODO: implement per ingress OCSP stapling control
-  -- and make use of uid. The idea is to have configureCertificates
-  -- in controller side to push uid -> is_ocsp_enabled data to Lua land.
-
   return _M.is_ocsp_stapling_enabled
 end
 
+--------------------------------------------------------------------------------
+-- Resolve a URL using DNS lookup.
+--------------------------------------------------------------------------------
 local function get_resolved_url(parsed_url)
   local scheme, host, port, path = unpack(parsed_url)
   local ip = dns_lookup(host)[1]
   return string.format("%s://%s:%s%s", scheme, ip, port, path)
 end
 
+--------------------------------------------------------------------------------
+-- Issue an OCSP request via HTTP.
+--------------------------------------------------------------------------------
 local function do_ocsp_request(url, ocsp_request)
   local httpc = http.new()
   httpc:set_timeout(1000, 1000, 2000)
@@ -95,8 +108,7 @@ local function do_ocsp_request(url, ocsp_request)
 
   local resolved_url = get_resolved_url(parsed_url)
 
-  local http_response
-  http_response, err = httpc:request_uri(resolved_url, {
+  local http_response, req_err = httpc:request_uri(resolved_url, {
     method = "POST",
     headers = {
       ["Content-Type"] = "application/ocsp-request",
@@ -106,7 +118,7 @@ local function do_ocsp_request(url, ocsp_request)
     ssl_server_name = parsed_url[2],
   })
   if not http_response then
-    return nil, err
+    return nil, req_err
   end
   if http_response.status ~= 200 then
     return nil, "unexpected OCSP responder status code: " .. tostring(http_response.status)
@@ -115,10 +127,205 @@ local function do_ocsp_request(url, ocsp_request)
   return http_response.body, nil
 end
 
--- TODO: ideally this function should have a lock around to ensure
--- only one instance runs at a time. Otherwise it is theoretically possible
--- that this function gets called from multiple Nginx workers at the same time.
--- While this has no functional implications, it generates extra load on OCSP servers.
+--------------------------------------------------------------------------------
+--[[
+  New helper functions using luaossl for OCSP response parsing.
+  
+  The OCSP response may be wrapped in a TLS CertificateStatus message:
+    - 1 byte: CertificateStatusType (1 for OCSP, 2 for OCSP multi)
+    - 3 bytes: 24-bit length (big-endian)
+    - N bytes: DER-encoded OCSP response
+  
+  If not wrapped, the data is assumed to be a raw DER-encoded OCSP response.
+]]--------------------------------------------------------------------------------
+
+local function extract_ocsp_response(data)
+  if #data < 4 then
+    return data  -- too short; assume raw DER.
+  end
+
+  local status_type = data:byte(1)
+  if status_type ~= 1 and status_type ~= 2 then
+    return data  -- not wrapped as CertificateStatus.
+  end
+
+  local len = (data:byte(2) * 65536) + (data:byte(3) * 256) + data:byte(4)
+  if #data ~= 4 + len then
+    return data  -- length mismatch; assume raw DER.
+  end
+
+  if status_type ~= 1 then
+    return nil, "unsupported CertificateStatusType: " .. status_type
+  end
+
+  return data:sub(5)
+end
+
+--------------------------------------------------------------------------------
+-- Parse a time string into a Unix timestamp.
+--
+-- Supports both UTCTime (YYMMDDhhmmssZ, 13 characters) and
+-- GeneralizedTime (YYYYMMDDhhmmssZ, 15 characters).
+--------------------------------------------------------------------------------
+local function parse_time_string(s)
+  if #s == 13 then
+    -- UTCTime format: YYMMDDhhmmssZ
+    local year = tonumber(s:sub(1,2))
+    local month = tonumber(s:sub(3,4))
+    local day = tonumber(s:sub(5,6))
+    local hour = tonumber(s:sub(7,8))
+    local min = tonumber(s:sub(9,10))
+    local sec = tonumber(s:sub(11,12))
+    if not (year and month and day and hour and min and sec) then
+      return nil, "failed to parse UTCTime string: " .. s
+    end
+    -- Per RFC5280: if year < 50 then year = 2000+year, else 1900+year.
+    if year < 50 then
+      year = year + 2000
+    else
+      year = year + 1900
+    end
+    local t = os.time({year = year, month = month, day = day, hour = hour, min = min, sec = sec})
+    local utc_offset = os.difftime(os.time(), os.time(os.date("!*t")))
+    return t - utc_offset
+  elseif #s == 15 then
+    -- GeneralizedTime format: YYYYMMDDhhmmssZ
+    local year = tonumber(s:sub(1,4))
+    local month = tonumber(s:sub(5,6))
+    local day = tonumber(s:sub(7,8))
+    local hour = tonumber(s:sub(9,10))
+    local min = tonumber(s:sub(11,12))
+    local sec = tonumber(s:sub(13,14))
+    if not (year and month and day and hour and min and sec) then
+      return nil, "failed to parse GeneralizedTime string: " .. s
+    end
+    local t = os.time({year = year, month = month, day = day, hour = hour, min = min, sec = sec})
+    local utc_offset = os.difftime(os.time(), os.time(os.date("!*t")))
+    return t - utc_offset
+  else
+    return nil, "unexpected time string format: " .. s
+  end
+end
+
+--------------------------------------------------------------------------------
+-- Use luaossl to decode the OCSP response and extract the nextUpdate timestamp.
+--
+-- Returns the Unix timestamp of nextUpdate or nil plus an error message.
+--------------------------------------------------------------------------------
+local function get_ocsp_next_update(ocsp_response)
+  local ocsp_der, err = extract_ocsp_response(ocsp_response)
+  if not ocsp_der then
+    return nil, err
+  end
+
+  local ocsp_resp, decode_err = openssl_asn1.decode(ocsp_der)
+  if not ocsp_resp then
+    return nil, "failed to decode OCSP response: " .. (decode_err or "unknown error")
+  end
+
+  -- According to RFC2560, the OCSPResponse structure is:
+  --   SEQUENCE {
+  --     responseStatus         ENUMERATED,
+  --     responseBytes          [0] EXPLICIT ResponseBytes OPTIONAL }
+  --
+  -- Extract the OCTET STRING that holds the DER-encoded BasicOCSPResponse.
+  local basic_der = nil
+  if ocsp_resp.value[2] and ocsp_resp.value[2].tag == "CONTEXT_SPECIFIC" then
+    local rb = ocsp_resp.value[2]
+    if rb.value and rb.value[1] and rb.value[1].tag == "SEQUENCE" and rb.value[1].value then
+      if rb.value[1].value[2] then
+        basic_der = rb.value[1].value[2].value
+      end
+    end
+  end
+
+  if not basic_der then
+    return nil, "failed to extract BasicOCSPResponse DER data"
+  end
+
+  local basic_ocsp, basic_err = openssl_asn1.decode(basic_der)
+  if not basic_ocsp then
+    return nil, "failed to decode BasicOCSPResponse: " .. (basic_err or "unknown error")
+  end
+
+  -- Navigate the BasicOCSPResponse structure.
+  -- BasicOCSPResponse ::= SEQUENCE {
+  --    tbsResponseData,
+  --    signatureAlgorithm,
+  --    signature,
+  --    [0] EXPLICIT certs OPTIONAL }
+  local tbs = basic_ocsp.value[1]
+  if not tbs or tbs.tag ~= "SEQUENCE" or not tbs.value then
+    return nil, "tbsResponseData not found in BasicOCSPResponse"
+  end
+
+  -- tbsResponseData (ResponseData) structure (simplified):
+  --   SEQUENCE {
+  --     [0] EXPLICIT version OPTIONAL,
+  --     responderID,
+  --     producedAt,
+  --     responses,  -- SEQUENCE OF SingleResponse
+  --     [1] EXPLICIT responseExtensions OPTIONAL
+  --   }
+  --
+  -- Determine the index of the responses element.
+  local responses_node = nil
+  if tbs.value[1] and tbs.value[1].tag == "CONTEXT_SPECIFIC" then
+    responses_node = tbs.value[4]
+  else
+    responses_node = tbs.value[3]
+  end
+
+  if not responses_node or responses_node.tag ~= "SEQUENCE" or not responses_node.value then
+    return nil, "responses field not found in tbsResponseData"
+  end
+
+  -- Get the first SingleResponse.
+  local single_response = responses_node.value[1]
+  if not single_response or single_response.tag ~= "SEQUENCE" or not single_response.value then
+    return nil, "no SingleResponse found"
+  end
+
+  -- SingleResponse structure (simplified):
+  --   SEQUENCE {
+  --     certID,
+  --     certStatus,
+  --     thisUpdate,  -- GeneralizedTime or UTCTime
+  --     nextUpdate    [0] EXPLICIT GeneralizedTime or UTCTime OPTIONAL,
+  --     singleExtensions [1] EXPLICIT Extensions OPTIONAL
+  --   }
+  local next_update_node = single_response.value[4]
+  if not next_update_node then
+    return nil, "nextUpdate field not present in the SingleResponse"
+  end
+
+  -- If the nextUpdate field is wrapped explicitly, unwrap it.
+  if next_update_node.tag == "CONTEXT_SPECIFIC" and next_update_node.value then
+    next_update_node = next_update_node.value[1]
+  end
+
+  if not next_update_node or (next_update_node.tag ~= "GENERALIZEDTIME" and next_update_node.tag ~= "UTCTIME") then
+    return nil, "unexpected format for nextUpdate field"
+  end
+
+  local time_str = next_update_node.value
+  if type(time_str) ~= "string" then
+    return nil, "nextUpdate value is not a string"
+  end
+
+  return parse_time_string(time_str)
+end
+
+--------------------------------------------------------------------------------
+-- Fetch and cache a new OCSP response.
+--
+-- This function:
+--   1. Extracts the OCSP responder URL from the DER certificate.
+--   2. Creates an OCSP request.
+--   3. Fetches the OCSP response.
+--   4. Validates it.
+--   5. Uses luaossl to extract the nextUpdate timestamp and calculates a dynamic cache expiry.
+--------------------------------------------------------------------------------
 local function fetch_and_cache_ocsp_response(uid, der_cert)
   local url, err = ocsp.get_ocsp_responder_from_der_chain(der_cert)
   if not url and err then
@@ -130,17 +337,15 @@ local function fetch_and_cache_ocsp_response(uid, der_cert)
     return
   end
 
-  local request
-  request, err = ocsp.create_ocsp_request(der_cert)
+  local request, req_err = ocsp.create_ocsp_request(der_cert)
   if not request then
-    ngx.log(ngx.ERR, "could not create OCSP request: ", err)
+    ngx.log(ngx.ERR, "could not create OCSP request: ", req_err)
     return
   end
 
-  local ocsp_response
-  ocsp_response, err = do_ocsp_request(url, request)
-  if err then
-    ngx.log(ngx.ERR, "could not get OCSP response: ", err)
+  local ocsp_response, req_err = do_ocsp_request(url, request)
+  if req_err then
+    ngx.log(ngx.ERR, "could not get OCSP response: ", req_err)
     return
   end
   if not ocsp_response or #ocsp_response == 0 then
@@ -148,61 +353,46 @@ local function fetch_and_cache_ocsp_response(uid, der_cert)
     return
   end
 
-  local ok
-  ok, err = ocsp.validate_ocsp_response(ocsp_response, der_cert)
+  local ok, validation_err = ocsp.validate_ocsp_response(ocsp_response, der_cert)
   if not ok then
-    -- We are doing the same thing as vanilla Nginx here - if response status is not "good"
-    -- we do not use it - no stapling.
-    -- We can look into differentiation of validation errors and when status is i.e "revoked"
-    -- we might want to continue with stapling - it is at the least counterintuitive that
-    -- one would not staple response when certificate is revoked (I have not managed to find
-    -- and spec about this). Also one would expect browsers to do all these verifications
-    -- comprehensively, so why we bother doing this on server side? This can be tricky though:
-    -- imagine the certificate is not revoked but its OCSP responder is having some issues
-    -- and not generating a valid OCSP response. We would then staple that invalid OCSP response
-    -- and then browser would fail the connection because of invalid OCSP response - as a result
-    -- user request fails. But as a server we can validate response here and not staple it
-    -- to the connection if it is invalid. But if browser/client has must-staple enabled
-    -- then this will break anyway. So for must-staple there's no difference from users'
-    -- perspective. When must-staple is not enabled though it is better to not staple
-    -- invalid response and let the client/browser to fallback to CRL check or retry OCSP
-    -- on its own.
-    --
-
-    -- Also we should do negative caching here to avoid sending too many request to
-    -- the OCSP responder. Imagine OCSP responder is having an intermittent issue
-    -- and we keep sending request. It might make things worse for the responder.
-
-    ngx.log(ngx.NOTICE, "OCSP response validation failed: ", err)
+    ngx.log(ngx.NOTICE, "OCSP response validation failed: ", validation_err)
     return
   end
 
-  -- Normally this should be (nextUpdate - thisUpdate), but Lua API does not expose
-  -- those attributes.
-  local expiry = 3600 * 24 * 3
-  local success, forcible
-  success, err, forcible = ocsp_response_cache:set(uid, ocsp_response, expiry)
+  -- Use luaossl to extract the nextUpdate timestamp.
+  local next_update, time_err = get_ocsp_next_update(ocsp_response)
+  if not next_update then
+    ngx.log(ngx.ERR, "failed to extract nextUpdate from OCSP response: ", time_err)
+    return
+  end
+
+  local current_time = ngx.time()
+  local grace_time   = 300  -- 5 minutes in seconds
+  local expiry       = next_update - current_time - grace_time
+
+  if expiry <= 0 then
+    ngx.log(ngx.ERR, "OCSP response is expired or too close to expiry, not caching")
+    return
+  end
+
+  local success, set_err, forcible = ocsp_response_cache:set(uid, ocsp_response, expiry)
   if not success then
-    ngx.log(ngx.ERR, "failed to cache OCSP response: ", err)
+    ngx.log(ngx.ERR, "failed to cache OCSP response: ", set_err)
   end
   if forcible then
-    ngx.log(ngx.NOTICE, "removed an existing item when saving OCSP response, ",
-      "consider increasing shared dictionary size for 'ocsp_response_cache'")
+    ngx.log(ngx.NOTICE, "removed an existing item when saving OCSP response; consider increasing shared dictionary size for 'ocsp_response_cache'")
   end
 end
 
--- ocsp_staple looks at the cache and staples response from cache if it exists
--- if there is no cached response or the existing response is stale,
--- it enqueues fetch_and_cache_ocsp_response function to refetch the response.
--- This design tradeoffs lack of OCSP response in the first request with better latency.
---
--- Serving stale response ensures that we don't serve another request without OCSP response
--- when the cache entry expires. Instead we serve the single request with stale response
--- and enqueue fetch_and_cache_ocsp_response for refetch.
+--------------------------------------------------------------------------------
+-- Try to use a cached OCSP response. If missing or stale, refresh in background.
+--------------------------------------------------------------------------------
 local function ocsp_staple(uid, der_cert)
-  local response, _, is_stale = ocsp_response_cache:get_stale(uid)
+  local response, flags, is_stale = ocsp_response_cache:get_stale(uid)
   if not response or is_stale then
-    ngx.timer.at(0, function() fetch_and_cache_ocsp_response(uid, der_cert) end)
+    ngx.timer.at(0, function()
+      fetch_and_cache_ocsp_response(uid, der_cert)
+    end)
     return false, nil
   end
 
@@ -214,6 +404,9 @@ local function ocsp_staple(uid, der_cert)
   return true, nil
 end
 
+--------------------------------------------------------------------------------
+-- Determine if a certificate is configured for the current request.
+--------------------------------------------------------------------------------
 function _M.configured_for_current_request()
   if ngx.ctx.cert_configured_for_current_request == nil then
     ngx.ctx.cert_configured_for_current_request = get_pem_cert_uid(ngx.var.host) ~= nil
@@ -222,14 +415,16 @@ function _M.configured_for_current_request()
   return ngx.ctx.cert_configured_for_current_request
 end
 
+--------------------------------------------------------------------------------
+-- Main entry point for dynamically configuring the certificate and optionally stapling OCSP.
+--------------------------------------------------------------------------------
 function _M.call()
   local hostname, hostname_err = ssl.server_name()
   if hostname_err then
     ngx.log(ngx.ERR, "error while obtaining hostname: " .. hostname_err)
   end
   if not hostname then
-    ngx.log(ngx.INFO, "obtained hostname is nil (the client does "
-      .. "not support SNI?), falling back to default certificate")
+    ngx.log(ngx.INFO, "obtained hostname is nil (the client does not support SNI?), falling back to default certificate")
     hostname = DEFAULT_CERT_HOSTNAME
   end
 
@@ -242,8 +437,7 @@ function _M.call()
     pem_cert = certificate_data:get(pem_cert_uid)
   end
   if not pem_cert then
-    ngx.log(ngx.ERR, "certificate not found, falling back to fake certificate for hostname: "
-      .. tostring(hostname))
+    ngx.log(ngx.ERR, "certificate not found, falling back to fake certificate for hostname: " .. tostring(hostname))
     return
   end
 
@@ -266,9 +460,9 @@ function _M.call()
   end
 
   if is_ocsp_stapling_enabled_for(pem_cert_uid) then
-    local _, err = ocsp_staple(pem_cert_uid, der_cert)
-    if err then
-      ngx.log(ngx.ERR, "error during OCSP stapling: ", err)
+    local _, stapling_err = ocsp_staple(pem_cert_uid, der_cert)
+    if stapling_err then
+      ngx.log(ngx.ERR, "error during OCSP stapling: ", stapling_err)
     end
   end
 end

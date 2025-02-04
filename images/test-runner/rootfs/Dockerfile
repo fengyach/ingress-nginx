@@ -89,7 +89,8 @@ RUN wget -qO /tmp/luarocks.tgz \
   && make install
 
 RUN  luarocks install busted \
-  && luarocks install luacheck
+  && luarocks install luacheck \
+  && luarocks install lua-resty-openssl \
 
 RUN wget -qO /usr/local/bin/kubectl \
   https://dl.k8s.io/release/${K8S_RELEASE}/bin/linux/${TARGETARCH}/kubectl \

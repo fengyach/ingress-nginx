@@ -39,6 +39,8 @@ SHDICT_ARGS=(
     "./rootfs/etc/nginx/lua/test/run.lua"
 )
 
+luarocks install lua-resty-openssl
+
 if [ $# -eq 0 ]; then
     resty "${SHDICT_ARGS[@]}" ./rootfs/etc/nginx/lua/test/ ${BUSTED_ARGS}
 else
