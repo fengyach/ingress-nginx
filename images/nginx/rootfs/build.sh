@@ -332,6 +332,14 @@ cd ssdeep/
 make
 make install
 
+# install lua-resty-openssl
+mkdir -p /usr/local/lib/lua/resty/openssl
+cd "$BUILD_PATH"
+git clone --depth=1 https://github.com/fffonion/lua-resty-openssl.git
+cd lua-resty-openssl
+make
+make install
+
 # build modsecurity library
 cd "$BUILD_PATH"
 git clone -n https://github.com/SpiderLabs/ModSecurity
