@@ -11,7 +11,7 @@ local openssl_asn1 = require("resty.openssl.asn1")
 local os           = os
 
 local _M = {
-  is_ocsp_stapling_enabled = false
+  is_ocsp_stapling_enabled = true
 }
 
 local DEFAULT_CERT_HOSTNAME = "_"
