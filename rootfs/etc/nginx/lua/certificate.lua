@@ -14,7 +14,7 @@ local _M = {
   is_ocsp_stapling_enabled = true
 }
 
-local DEFAULT_CERT_HOSTNAME = "_"
+local DEFAULT_CERT_HOSTNAME = "localhost"
 
 local certificate_data    = ngx.shared.certificate_data
 local certificate_servers = ngx.shared.certificate_servers
@@ -249,11 +249,6 @@ local function get_ocsp_next_update(ocsp_response)
   end
 
   -- Navigate the BasicOCSPResponse structure.
-  -- BasicOCSPResponse ::= SEQUENCE {
-  --    tbsResponseData,
-  --    signatureAlgorithm,
-  --    signature,
-  --    [0] EXPLICIT certs OPTIONAL }
   local tbs = basic_ocsp.value[1]
   if not tbs or tbs.tag ~= "SEQUENCE" or not tbs.value then
     return nil, "tbsResponseData not found in BasicOCSPResponse"
@@ -296,7 +291,8 @@ local function get_ocsp_next_update(ocsp_response)
   --   }
   local next_update_node = single_response.value[4]
   if not next_update_node then
-    return nil, "nextUpdate field not present in the SingleResponse"
+    ngx.log(ngx.NOTICE, "nextUpdate field not present in the SingleResponse; applying default validity period of 1 hour")
+    return ngx.time() + 3600
   end
 
   -- If the nextUpdate field is wrapped explicitly, unwrap it.
@@ -385,15 +381,24 @@ local function fetch_and_cache_ocsp_response(uid, der_cert)
 end
 
 --------------------------------------------------------------------------------
--- Try to use a cached OCSP response. If missing or stale, refresh in background.
+-- Try to use a cached OCSP response. If missing, refresh in background.
+-- 
+-- Modification (Point 5): If the cached response is stale but available,
+-- still use it for stapling while scheduling an asynchronous refresh.
 --------------------------------------------------------------------------------
 local function ocsp_staple(uid, der_cert)
   local response, flags, is_stale = ocsp_response_cache:get_stale(uid)
-  if not response or is_stale then
+  if not response then
     ngx.timer.at(0, function()
       fetch_and_cache_ocsp_response(uid, der_cert)
     end)
     return false, nil
+  end
+
+  if is_stale then
+    ngx.timer.at(0, function()
+      fetch_and_cache_ocsp_response(uid, der_cert)
+    end)
   end
 
   local ok, err = ocsp.set_ocsp_status_resp(response)
